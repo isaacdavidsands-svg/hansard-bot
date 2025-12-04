@@ -8,7 +8,6 @@ from flask import Flask
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-from duckduckgo_search import DDGS
 
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -58,61 +57,22 @@ def split_sentences(text):
 
 def get_debate_context(query):
     """
-    Uses DuckDuckGo to find the official debate title or context.
+    (Disabled) Uses DuckDuckGo to find the official debate title or context.
     Returns (context_snippet, expanded_query_terms)
     """
-    try:
-        search_query = f"{query} UK Parliament debate"
-        with DDGS() as ddgs:
-            results = list(ddgs.text(search_query, max_results=1))
-            
-        if results:
-            title = results[0]['title']
-            snippet = results[0]['body']
-            return f"ℹ️ <b>Web Context:</b> {html.escape(title)}\n<i>{html.escape(snippet)}</i>\n\n", title
-            
-    except Exception as e:
-        logging.error(f"DDG Search failed: {e}")
-    
     return "", ""
 
 def generate_ai_summary(query, snippets):
     """
-    Uses DuckDuckGo AI Chat to synthesize a stance analysis for each MP.
+    (Disabled) Uses DuckDuckGo AI Chat to synthesize a stance analysis for each MP.
     """
-    try:
-        if not snippets:
-            return ""
-            
-        # Prepare the prompt for Advocacy Mode
-        prompt = (
-            f"You are a political analyst for an advocacy group. Analyze the specific stance of each MP regarding '{query}' based on these excerpts:\n\n"
-        )
-        for i, s in enumerate(snippets[:5]): 
-            prompt += f"{i+1}. {s}\n"
-        
-        prompt += (
-            "\nProvide a bulleted list (max 1 sentence per MP) describing their specific view/stance. "
-            "Format: • **MP Name**: [Stance Summary]"
-        )
-
-        with DDGS() as ddgs:
-            # Using the chat feature
-            response = ddgs.chat(prompt, model='gpt-4o-mini')
-            
-        if response:
-            return f"🎯 <b>MP Stance Analysis:</b>\n{html.escape(response)}\n\n"
-            
-    except Exception as e:
-        logging.error(f"AI Summary failed: {e}")
-        
     return ""
 
 def search_theyworkforyou(raw_query):
     # 1. Smart Filter: Clean the query
     base_keywords = extract_keywords(raw_query)
     
-    # 2. Web Context Expansion
+    # 2. Web Context Expansion (Disabled)
     web_context_msg, extra_context_title = get_debate_context(base_keywords)
     
     search_terms = base_keywords.lower().split()
@@ -133,7 +93,6 @@ def search_theyworkforyou(raw_query):
         return "⚠️ Configuration Error: API Key is missing."
 
     try:
-        # Added timeout
         response = requests.get(url, params=params, timeout=10)
         
         if response.status_code != 200:
@@ -146,6 +105,7 @@ def search_theyworkforyou(raw_query):
 
         # Count speakers and store relevant snippets
         strict_counts = {}
+        fuzzy_counts = {}
         loose_counts = {}
         debate_info = {} 
 
@@ -171,101 +131,97 @@ def search_theyworkforyou(raw_query):
 
             sentences = split_sentences(body_text)
             
-            # --- PASS 1: STRICT (Title + Sliding Window) ---
-            found_strict = False
+            # --- SCORING LOGIC ---
             best_snippet = ""
+            max_score = 0
             
-            def score_window(text_window):
-                # Score based on how many unique search terms are present
+            def calculate_score(text_window):
                 context = f"{debate_title} {text_window} {extra_context_title}".lower()
                 user_terms = base_keywords.lower().split()
                 matches = sum(1 for term in user_terms if term in context)
-                return matches
+                return matches / len(user_terms) if user_terms else 0
 
             if len(sentences) <= 3:
-                score = score_window(body_text)
-                if score == len(base_keywords.lower().split()): # All terms present
-                    found_strict = True
-                    best_snippet = body_text
+                max_score = calculate_score(body_text)
+                best_snippet = body_text
             else:
                 for i in range(len(sentences) - 2):
                     window = " ".join(sentences[i:i+3])
-                    score = score_window(window)
-                    if score == len(base_keywords.lower().split()):
-                        found_strict = True
+                    score = calculate_score(window)
+                    if score > max_score:
+                        max_score = score
                         best_snippet = window + "..."
-                        break
             
-            if found_strict:
+            # --- CLASSIFICATION ---
+            list_url = item.get('listurl', '')
+            info_payload = {
+                "link": f"https://www.theyworkforyou.com{list_url}", 
+                "snippet": best_snippet,
+                "title": debate_title,
+                "party": party,
+                "constituency": constituency
+            }
+
+            if max_score == 1.0: # STRICT: 100% Match
                 if speaker_name in strict_counts: strict_counts[speaker_name] += 1
                 else: strict_counts[speaker_name] = 1
                 
+                if speaker_name not in debate_info or debate_info[speaker_name]["type"] != "Strict":
+                    info_payload["type"] = "Strict"
+                    debate_info[speaker_name] = info_payload
+                    
+            elif max_score >= 0.5: # FUZZY: >50% Match
+                if speaker_name in fuzzy_counts: fuzzy_counts[speaker_name] += 1
+                else: fuzzy_counts[speaker_name] = 1
+                
                 if speaker_name not in debate_info or debate_info[speaker_name]["type"] == "Loose":
-                    list_url = item.get('listurl', '')
-                    debate_info[speaker_name] = {
-                        "link": f"https://www.theyworkforyou.com{list_url}", 
-                        "snippet": best_snippet,
-                        "title": debate_title,
-                        "type": "Strict",
-                        "party": party,
-                        "constituency": constituency
-                    }
-                continue 
-
-            # --- PASS 2: LOOSE (Title + Whole Body) ---
-            # Trust the API's relevance. If it's here, it's relevant enough for "Loose".
-            # We just check if it's already in strict to avoid duplicates.
-            if speaker_name in loose_counts: loose_counts[speaker_name] += 1
-            else: loose_counts[speaker_name] = 1
+                    info_payload["type"] = "Fuzzy"
+                    debate_info[speaker_name] = info_payload
             
-            if speaker_name not in debate_info:
-                list_url = item.get('listurl', '')
-                debate_info[speaker_name] = {
-                    "link": f"https://www.theyworkforyou.com{list_url}", 
-                    "snippet": body_text[:200] + "...",
-                    "title": debate_title,
-                    "type": "Loose",
-                    "party": party,
-                    "constituency": constituency
-                }
+            else: # LOOSE: Fallback
+                if speaker_name in loose_counts: loose_counts[speaker_name] += 1
+                else: loose_counts[speaker_name] = 1
+                
+                if speaker_name not in debate_info:
+                    info_payload["type"] = "Loose"
+                    info_payload["snippet"] = body_text[:200] + "..." # Use generic snippet for loose
+                    debate_info[speaker_name] = info_payload
 
-        # Decide which results to show
+        # Decide which results to show (Priority: Strict > Fuzzy > Loose)
         if strict_counts:
             sorted_speakers = sorted(strict_counts.items(), key=lambda item: item[1], reverse=True)[:5]
             result_type = "Strict"
+        elif fuzzy_counts:
+            sorted_speakers = sorted(fuzzy_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+            result_type = "Fuzzy"
         elif loose_counts:
             sorted_speakers = sorted(loose_counts.items(), key=lambda item: item[1], reverse=True)[:5]
             result_type = "Loose"
         else:
             return f"{web_context_msg}I searched for '{base_keywords}', but found no matches even with loose filtering."
 
-        # --- AI SUMMARIZATION ---
-        # Collect top snippets for the AI
-        top_snippets = []
-        for speaker, _ in sorted_speakers:
-            info = debate_info.get(speaker, {})
-            snippet = info.get("snippet", "")
-            mp_name = speaker
-            top_snippets.append(f"{mp_name}: {snippet}")
-            
-        ai_summary = generate_ai_summary(base_keywords, top_snippets)
+        # --- AI SUMMARIZATION (Disabled) ---
+        ai_summary = ""
         
         # Build message
         safe_query = html.escape(base_keywords)
         top_mp, top_count = sorted_speakers[0]
         safe_top_mp = html.escape(top_mp)
         
-        # Prefer AI summary, fallback to Web Context if AI fails or returns empty
         if ai_summary:
             message = ai_summary
         else:
-            message = web_context_msg + "⚠️ <i>(AI Analysis unavailable, showing raw results)</i>\n\n"
+            # message = web_context_msg + "⚠️ <i>(AI Analysis unavailable, showing raw results)</i>\n\n"
+            message = web_context_msg # Simplified message since AI is permanently disabled
         
         if result_type == "Strict":
             message += f"🏆 <b>{safe_top_mp}</b> is the leading voice on '<i>{safe_query}</i>', with {top_count} verified mentions.\n\n"
             message += "<b>Top Speakers & Context:</b>\n"
+        elif result_type == "Fuzzy":
+             message += f"⚠️ <b>Note:</b> Exact phrase not found. Showing best partial matches for '<i>{safe_query}</i>'.\n"
+             message += f"🏆 <b>{safe_top_mp}</b> has {top_count} relevant mentions.\n\n"
         else:
-            message += f"⚠️ <b>Note:</b> Exact context not found. Showing general mentions for '<i>{safe_query}</i>'.\n"
+            message += f"⚠️ <b>Note:</b> Keywords not found closely together. Showing general mentions for '<i>{safe_query}</i>'.\n"
             message += f"🏆 <b>{safe_top_mp}</b> has {top_count} mentions.\n\n"
 
         rank = 1
@@ -275,7 +231,6 @@ def search_theyworkforyou(raw_query):
             snippet = info.get("snippet", "No preview")
             title = info.get("title", "Unknown Debate")
             party = info.get("party", "Unknown")
-            constituency = info.get("constituency", "")
             
             if len(snippet) > 150: snippet = snippet[:150] + "..."
                 
